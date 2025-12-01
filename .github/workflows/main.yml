@@ -1,0 +1,116 @@
+name: Build Cross-Platform Wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: 'Space-separated list of packages to build (e.g., numpy pandas)'
+        required: false
+        default: ''
+  push:
+    paths:
+      - 'requirements.txt'
+
+jobs:
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # We use Ubuntu to build Linux wheels (works for Termux/Android/n8n Docker)
+        os: [ubuntu-latest]
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        # Essential for compiling ARM64 (Mobile) code on GitHub's x86 runners
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+
+      - name: Install cibuildwheel
+        run: python -m pip install cibuildwheel==2.16.5
+
+      - name: Determine Packages to Build
+        id: set-packages
+        run: |
+          if [ -n "${{ inputs.packages }}" ]; then
+            echo "Using manual input packages"
+            echo "PACKAGES=${{ inputs.packages }}" >> $GITHUB_ENV
+          elif [ -f requirements.txt ]; then
+            echo "Using requirements.txt"
+            # Read requirements.txt and replace newlines with spaces
+            echo "PACKAGES=$(cat requirements.txt | tr '\n' ' ')" >> $GITHUB_ENV
+          else
+            echo "No input found. Please provide input or a requirements.txt file."
+            exit 1
+          fi
+
+      - name: Build Wheels
+        env:
+          # CIBW_BUILD: Build specific python versions (e.g., cp311-*)
+          # Leave empty to build for all supported versions.
+          
+          # ARCHITECTURES:
+          # x86_64 = Standard servers / laptops
+          # aarch64 = Mobile devices (Termux), Raspberry Pi, Apple Silicon
+          CIBW_ARCHS_LINUX: x86_64 aarch64
+          
+          # IGNORE: Skip PyPy and musllinux (Alpine) unless you specifically need them
+          CIBW_SKIP: "pp* *musllinux*"
+
+        run: |
+          # We loop through the requested packages and build wheels for them
+          for package in ${{ env.PACKAGES }}; do
+            echo "Building $package..."
+            python -m cibuildwheel --output-dir wheelhouse --platform linux package_dir_dummy
+            
+            # Note: cibuildwheel usually expects a local setup.py. 
+            # To build from PyPI (like TUR does), we use pip wheel inside the docker container.
+            # However, a cleaner hack using cibuildwheel for PyPI packages is:
+            cibuildwheel_cmd="pip wheel $package --no-deps -w /output"
+            
+            # Manually triggering the docker container provided by cibuildwheel for strict control
+            # or simply using pip wheel with the QEMU setup:
+            
+            pip wheel $package --no-deps --wheel-dir ./wheelhouse
+          done
+
+      - name: Build Wheels (Robust Method)
+        # The previous step attempts to use the host. 
+        # For true cross-compilation (ARM64), we must use cibuildwheel's Docker mechanism.
+        # Since we are building *external* libraries (from PyPI), not local code, we use a trick:
+        env:
+          CIBW_ARCHS_LINUX: x86_64 aarch64
+          CIBW_SKIP: "pp* *musllinux*"
+          CIBW_BEFORE_BUILD: "pip install --upgrade pip"
+        run: |
+          # Create a dummy setup.py to trick cibuildwheel if needed, 
+          # OR use 'pip wheel' inside a manylinux container directly.
+          
+          # DIRECT APPROACH for PyPI packages targeting ARM64/x86_64:
+          # We use the official manylinux docker images to ensure compatibility.
+          
+          # 1. Build for x86_64
+          docker run --rm -v $(pwd):/io quay.io/pypa/manylinux2014_x86_64 /bin/bash -c "\
+            for py in /opt/python/cp310-*/bin; do \
+              PATH=\$py:\$PATH; \
+              pip wheel ${{ env.PACKAGES }} -w /io/wheelhouse_x86 --no-deps; \
+            done"
+
+          # 2. Build for aarch64 (Mobile/Termux) - Requires QEMU step above
+          docker run --rm -v $(pwd):/io quay.io/pypa/manylinux2014_aarch64 /bin/bash -c "\
+            for py in /opt/python/cp311-*/bin; do \
+              PATH=\$py:\$PATH; \
+              pip wheel ${{ env.PACKAGES }} -w /io/wheelhouse_arm --no-deps; \
+            done"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-wheels
+          path: |
+            wheelhouse_x86/*.whl
+            wheelhouse_arm/*.whl
